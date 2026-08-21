@@ -1,14 +1,16 @@
 import asyncio
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 from aiohttp import web
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.types import (
     UpdateUserStatus, UserStatusOnline, UserStatusOffline,
-    ReactionEmoji
+    ReactionEmoji, User
 )
+from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
+from telethon.tl.functions.users import GetFullUserRequest
 from telethon.tl.functions.stories import (
     GetPeerStoriesRequest, ReadStoriesRequest, SendReactionRequest
 )
@@ -32,8 +34,8 @@ def load_data():
             pass
     return {
         "targets": {
-            "8281020365": {"name": "User", "status": "offline", "last_on": None, "last_off": None, "total_on": 0, "sessions": 0},
-            "8750101205": {"name": "User", "status": "offline", "last_on": None, "last_off": None, "total_on": 0, "sessions": 0}
+            "8281020365": {"name": "Target 1", "status": "offline", "last_on": None, "last_off": None, "total_on": 0, "sessions": 0},
+            "8750101205": {"name": "Target 2", "status": "offline", "last_on": None, "last_off": None, "total_on": 0, "sessions": 0}
         },
         "story_targets": [8281020365, 8750101205],
         "viewed_stories": {}
@@ -63,23 +65,55 @@ def format_duration(seconds):
         parts.append(f"{secs} soniya")
     return " ".join(parts)
 
+async def resolve_channel():
+    global channel_entity
+    link = CHANNEL_INVITE_LINK.strip()
+    try:
+        if '+' in link or 'joinchat' in link:
+            hash_val = link.split('+')[-1].split('/')[-1]
+            try:
+                updates = await client(ImportChatInviteRequest(hash_val))
+                channel_entity = updates.chats[0]
+            except Exception:
+                check = await client(CheckChatInviteRequest(hash_val))
+                if hasattr(check, 'chat'):
+                    channel_entity = check.chat
+        else:
+            channel_entity = await client.get_entity(link)
+        print(f"✅ Kanal ulandi: {getattr(channel_entity, 'title', channel_entity)}")
+    except Exception as e:
+        print(f"⚠️ Kanalga ulanish xatosi: {e}")
+
+async def send_to_channel(text):
+    global channel_entity
+    if not channel_entity:
+        await resolve_channel()
+    if channel_entity:
+        try:
+            await client.send_message(channel_entity, text)
+        except Exception as e:
+            print(f"Xabar yuborishda xato: {e}")
+
 @client.on(events.Raw(UpdateUserStatus))
-async def status_handler(event):
-    global channel_entity, target_entities, db
-    
+async def raw_status_handler(event):
     uid_str = str(event.user_id)
     if uid_str not in db["targets"]:
         return
+    await process_status_change(event.user_id, event.status)
 
+async def process_status_change(uid, status_obj):
+    global db
+    uid_str = str(uid)
     now = datetime.now()
     clock_str = now.strftime('%H:%M:%S')
     time_full = now.strftime('%Y-%m-%d %H:%M:%S')
-    user = db["targets"][uid_str]
-    target_ent = target_entities.get(event.user_id)
-    name = get_display_name(target_ent) if target_ent else user.get("name", uid_str)
+    user = db["targets"].get(uid_str, {})
+    
+    ent = target_entities.get(uid)
+    name = get_display_name(ent) if ent else user.get("name", uid_str)
     user["name"] = name
 
-    if isinstance(event.status, UserStatusOnline):
+    if isinstance(status_obj, UserStatusOnline):
         if user.get("status") == "online":
             return
         
@@ -104,13 +138,9 @@ async def status_handler(event):
             f"⏰ **Vaqt:** `{clock_str}`\n"
             f"💤 **Offline turgan vaqti:** `{offline_dur_str}`"
         )
-        if channel_entity:
-            try:
-                await client.send_message(channel_entity, text)
-            except Exception as e:
-                print(f"Xabar yuborishda xato: {e}")
+        await send_to_channel(text)
 
-    elif isinstance(event.status, UserStatusOffline):
+    elif isinstance(status_obj, UserStatusOffline):
         if user.get("status") == "offline":
             return
         
@@ -135,14 +165,26 @@ async def status_handler(event):
             f"⏰ **Vaqt:** `{clock_str}`\n"
             f"⚡️ **Online bo'lgan vaqti:** `{online_dur_str}`"
         )
-        if channel_entity:
-            try:
-                await client.send_message(channel_entity, text)
-            except Exception as e:
-                print(f"Xabar yuborishda xato: {e}")
+        await send_to_channel(text)
+
+async def active_monitor_loop():
+    while True:
+        try:
+            for uid_str in list(db["targets"].keys()):
+                try:
+                    uid = int(uid_str) if uid_str.isdigit() else uid_str
+                    user_full = await client(GetFullUserRequest(uid))
+                    user_obj = user_full.users[0] if user_full.users else None
+                    if user_obj and user_obj.status:
+                        await process_status_change(user_obj.id, user_obj.status)
+                except Exception:
+                    pass
+                await asyncio.sleep(2)
+        except Exception:
+            pass
+        await asyncio.sleep(10)
 
 async def check_stories_loop():
-    global db, channel_entity
     while True:
         try:
             story_targets = list(db.get("story_targets", []))
@@ -183,18 +225,17 @@ async def check_stories_loop():
                                     f"📸 **Story ID:** `{story_id}`\n"
                                     f"⏰ **Vaqt:** `{now_str}`"
                                 )
-                                if channel_entity:
-                                    await client.send_message(channel_entity, log_msg)
+                                await send_to_channel(log_msg)
                 except Exception:
                     pass
                 await asyncio.sleep(2)
         except Exception:
             pass
-        await asyncio.sleep(25)
+        await asyncio.sleep(20)
 
 @client.on(events.NewMessage(from_users="me"))
 async def commands(event):
-    global channel_entity, target_entities, db
+    global target_entities, db
     raw = event.raw_text.strip()
     parts = raw.split()
     cmd = parts[0] if parts else ""
@@ -256,7 +297,7 @@ async def commands(event):
             await event.edit(f"❌ Xatolik: {e}")
 
 async def handle_ping(request):
-    return web.Response(text="Bot is running and port is open!")
+    return web.Response(text="Tracker Running 24/7")
 
 async def run_web_server():
     app = web.Application()
@@ -267,14 +308,11 @@ async def run_web_server():
     await site.start()
 
 async def main():
-    global channel_entity, target_entities, db
+    global target_entities, db
     await client.start()
-    print("Userbot to'liq ishga tushdi.")
+    print("Userbot to'liq faol.")
 
-    try:
-        channel_entity = await client.get_entity(CHANNEL_INVITE_LINK)
-    except Exception as e:
-        print(f"Kanal topilmadi: {e}")
+    await resolve_channel()
 
     for uid_str in list(db["targets"].keys()):
         try:
@@ -282,11 +320,12 @@ async def main():
             ent = await client.get_entity(uid)
             target_entities[ent.id] = ent
             db["targets"][uid_str]["name"] = get_display_name(ent)
-        except Exception as e:
-            print(f"ID {uid_str} yuklanmadi: {e}")
+        except Exception:
+            pass
 
     save_data(db)
     asyncio.create_task(run_web_server())
+    asyncio.create_task(active_monitor_loop())
     asyncio.create_task(check_stories_loop())
 
 with client:
